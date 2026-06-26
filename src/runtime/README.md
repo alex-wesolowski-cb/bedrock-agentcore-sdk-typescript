@@ -164,6 +164,9 @@ Returns:
 }
 ```
 
+`time_of_last_update` is a Unix timestamp in seconds. It advances when the health status changes and is refreshed
+on each `HealthyBusy` response so AgentCore receives a busy heartbeat while work continues.
+
 ### Invocation Endpoint
 
 `POST /invocations`
@@ -289,7 +292,8 @@ app.completeAsyncTask(taskId)
 
 ### Custom Health Logic
 
-Implement custom health check logic based on your application's needs:
+Implement custom health check logic based on your application's needs. The handler is called synchronously, so return
+a health status directly:
 
 ```typescript
 const app = new BedrockAgentCoreApp({

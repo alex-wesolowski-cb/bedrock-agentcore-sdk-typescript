@@ -1,7 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { Readable } from 'stream'
 import { z } from 'zod'
-import type { InvocationHandler, WebSocketHandler } from '../types.js'
+import type { HealthStatus, InvocationHandler, WebSocketHandler } from '../types.js'
 import { BedrockAgentCoreApp } from '../app.js'
 
 // Mock fastify module
@@ -17,6 +17,7 @@ vi.mock('fastify', () => {
       log: {
         error: vi.fn(),
         info: vi.fn(),
+        warn: vi.fn(),
       },
     }
   })
@@ -262,6 +263,256 @@ describe('BedrockAgentCoreApp', () => {
         status: expect.stringMatching(/^(Healthy|HealthyBusy)$/),
         time_of_last_update: expect.any(Number),
       })
+    })
+
+    it('refreshes custom ping timestamps while busy', async () => {
+      const nowSpy = vi.spyOn(Date, 'now').mockReturnValue(500)
+      try {
+        let customStatus: HealthStatus = 'Healthy'
+        const handler: InvocationHandler = async (_request, _context) => 'test response'
+        const app = new BedrockAgentCoreApp({
+          invocationHandler: { process: handler },
+          pingHandler: () => customStatus,
+        })
+        const mockApp = app['_app'] as any
+
+        app['_setupRoutes']()
+
+        const getCall = mockApp.get.mock.calls.find((call: any[]) => call[0] === '/ping')
+        const pingHandler = getCall[1]
+        const mockReq = {}
+        const mockReply = { send: vi.fn() }
+
+        nowSpy.mockReturnValue(1000)
+        await pingHandler(mockReq, mockReply)
+        expect(mockReply.send).toHaveBeenLastCalledWith({
+          status: 'Healthy',
+          time_of_last_update: 1,
+        })
+
+        nowSpy.mockReturnValue(2000)
+        await pingHandler(mockReq, mockReply)
+        expect(mockReply.send).toHaveBeenLastCalledWith({
+          status: 'Healthy',
+          time_of_last_update: 1,
+        })
+
+        customStatus = 'HealthyBusy'
+        nowSpy.mockReturnValue(3000)
+        await pingHandler(mockReq, mockReply)
+        expect(mockReply.send).toHaveBeenLastCalledWith({
+          status: 'HealthyBusy',
+          time_of_last_update: 3,
+        })
+
+        nowSpy.mockReturnValue(4000)
+        await pingHandler(mockReq, mockReply)
+        expect(mockReply.send).toHaveBeenLastCalledWith({
+          status: 'HealthyBusy',
+          time_of_last_update: 4,
+        })
+
+        customStatus = 'Healthy'
+        nowSpy.mockReturnValue(5000)
+        await pingHandler(mockReq, mockReply)
+        expect(mockReply.send).toHaveBeenLastCalledWith({
+          status: 'Healthy',
+          time_of_last_update: 5,
+        })
+      } finally {
+        nowSpy.mockRestore()
+      }
+    })
+
+    it('falls back to automatic ping status when custom handler throws', async () => {
+      const nowSpy = vi.spyOn(Date, 'now').mockReturnValue(500)
+      try {
+        const handler: InvocationHandler = async (_request, _context) => 'test response'
+        const app = new BedrockAgentCoreApp({
+          invocationHandler: { process: handler },
+          pingHandler: () => {
+            throw new Error('ping failed')
+          },
+        })
+        const mockApp = app['_app'] as any
+
+        app.addAsyncTask('test-task')
+        app['_setupRoutes']()
+
+        const getCall = mockApp.get.mock.calls.find((call: any[]) => call[0] === '/ping')
+        const pingHandler = getCall[1]
+        const mockReq = {}
+        const mockReply = { send: vi.fn() }
+
+        nowSpy.mockReturnValue(2000)
+        await pingHandler(mockReq, mockReply)
+        expect(mockReply.send).toHaveBeenLastCalledWith({
+          status: 'HealthyBusy',
+          time_of_last_update: 2,
+        })
+        expect(mockApp.log.warn).toHaveBeenCalledWith('custom ping handler failed, falling back to automatic')
+      } finally {
+        nowSpy.mockRestore()
+      }
+    })
+
+    it('falls back to automatic ping status when custom handler returns a promise', async () => {
+      const nowSpy = vi.spyOn(Date, 'now').mockReturnValue(500)
+      try {
+        const handler: InvocationHandler = async (_request, _context) => 'test response'
+        const asyncPingHandler = (async (): Promise<HealthStatus> => 'HealthyBusy') as unknown as () => HealthStatus
+        const app = new BedrockAgentCoreApp({
+          invocationHandler: { process: handler },
+          pingHandler: asyncPingHandler,
+        })
+        const mockApp = app['_app'] as any
+
+        app['_setupRoutes']()
+
+        const getCall = mockApp.get.mock.calls.find((call: any[]) => call[0] === '/ping')
+        const pingHandler = getCall[1]
+        const mockReq = {}
+        const mockReply = { send: vi.fn() }
+
+        nowSpy.mockReturnValue(2000)
+        await pingHandler(mockReq, mockReply)
+        expect(mockReply.send).toHaveBeenLastCalledWith({
+          status: 'Healthy',
+          time_of_last_update: 2,
+        })
+        expect(mockApp.log.warn).toHaveBeenCalledWith(
+          'custom ping handler returned a promise, falling back to automatic'
+        )
+      } finally {
+        nowSpy.mockRestore()
+      }
+    })
+
+    it('handles rejecting async custom handlers without an unhandled rejection', async () => {
+      const nowSpy = vi.spyOn(Date, 'now').mockReturnValue(500)
+      try {
+        const handler: InvocationHandler = async (_request, _context) => 'test response'
+        const asyncPingHandler = (async (): Promise<HealthStatus> => {
+          throw new Error('ping failed')
+        }) as unknown as () => HealthStatus
+        const app = new BedrockAgentCoreApp({
+          invocationHandler: { process: handler },
+          pingHandler: asyncPingHandler,
+        })
+        const mockApp = app['_app'] as any
+
+        app.addAsyncTask('test-task')
+        app['_setupRoutes']()
+
+        const getCall = mockApp.get.mock.calls.find((call: any[]) => call[0] === '/ping')
+        const pingHandler = getCall[1]
+        const mockReq = {}
+        const mockReply = { send: vi.fn() }
+
+        nowSpy.mockReturnValue(2000)
+        await pingHandler(mockReq, mockReply)
+        await Promise.resolve()
+
+        expect(mockReply.send).toHaveBeenLastCalledWith({
+          status: 'HealthyBusy',
+          time_of_last_update: 2,
+        })
+        expect(mockApp.log.warn).toHaveBeenCalledWith(
+          'custom ping handler returned a promise, falling back to automatic'
+        )
+        expect(mockApp.log.warn).toHaveBeenCalledWith(
+          'custom ping handler failed asynchronously, falling back to automatic'
+        )
+      } finally {
+        nowSpy.mockRestore()
+      }
+    })
+
+    it('does not expose custom ping status as an async task', async () => {
+      const nowSpy = vi.spyOn(Date, 'now').mockReturnValue(500)
+      try {
+        let shouldThrow = false
+        const handler: InvocationHandler = async (_request, _context) => 'test response'
+        const app = new BedrockAgentCoreApp({
+          invocationHandler: { process: handler },
+          pingHandler: () => {
+            if (shouldThrow) {
+              throw new Error('ping failed')
+            }
+            return 'HealthyBusy'
+          },
+        })
+        const mockApp = app['_app'] as any
+
+        app['_setupRoutes']()
+
+        const getCall = mockApp.get.mock.calls.find((call: any[]) => call[0] === '/ping')
+        const pingHandler = getCall[1]
+        const mockReq = {}
+        const mockReply = { send: vi.fn() }
+
+        nowSpy.mockReturnValue(1000)
+        await pingHandler(mockReq, mockReply)
+        expect(mockReply.send).toHaveBeenLastCalledWith({
+          status: 'HealthyBusy',
+          time_of_last_update: 1,
+        })
+        expect(app.getAsyncTaskInfo().activeCount).toBe(0)
+
+        shouldThrow = true
+        nowSpy.mockReturnValue(2000)
+        await pingHandler(mockReq, mockReply)
+        expect(mockReply.send).toHaveBeenLastCalledWith({
+          status: 'Healthy',
+          time_of_last_update: 2,
+        })
+        expect(app.getAsyncTaskInfo().activeCount).toBe(0)
+      } finally {
+        nowSpy.mockRestore()
+      }
+    })
+
+    it('updates forced ping status timestamps when status changes', async () => {
+      const nowSpy = vi.spyOn(Date, 'now').mockReturnValue(500)
+      try {
+        const handler: InvocationHandler = async (_request, _context) => 'test response'
+        const app = new BedrockAgentCoreApp({ invocationHandler: { process: handler } })
+        const mockApp = app['_app'] as any
+
+        app['_setupRoutes']()
+
+        const getCall = mockApp.get.mock.calls.find((call: any[]) => call[0] === '/ping')
+        const pingHandler = getCall[1]
+        const mockReq = {}
+        const mockReply = { send: vi.fn() }
+
+        nowSpy.mockReturnValue(1000)
+        await pingHandler(mockReq, mockReply)
+        expect(mockReply.send).toHaveBeenLastCalledWith({
+          status: 'Healthy',
+          time_of_last_update: 1,
+        })
+
+        app['_forcedPingStatus'] = 'HealthyBusy'
+        nowSpy.mockReturnValue(2000)
+        await pingHandler(mockReq, mockReply)
+        expect(mockReply.send).toHaveBeenLastCalledWith({
+          status: 'HealthyBusy',
+          time_of_last_update: 2,
+        })
+        expect(app.getAsyncTaskInfo().activeCount).toBe(0)
+
+        app['_forcedPingStatus'] = 'Healthy'
+        nowSpy.mockReturnValue(3000)
+        await pingHandler(mockReq, mockReply)
+        expect(mockReply.send).toHaveBeenLastCalledWith({
+          status: 'Healthy',
+          time_of_last_update: 3,
+        })
+        expect(app.getAsyncTaskInfo().activeCount).toBe(0)
+      } finally {
+        nowSpy.mockRestore()
+      }
     })
   })
 
@@ -908,6 +1159,32 @@ describe('BedrockAgentCoreApp', () => {
 
       app.completeAsyncTask(id1)
       expect(app.getAsyncTaskInfo().activeCount).toBe(1)
+    })
+
+    it('does not report custom HealthyBusy status as active task tracking', () => {
+      let customStatus: HealthStatus = 'Healthy'
+      const handler: InvocationHandler = async (_request, _context) => 'test'
+      const app = new BedrockAgentCoreApp({
+        invocationHandler: { process: handler },
+        pingHandler: () => customStatus,
+      })
+
+      expect(app.getCurrentPingStatus()).toBe('Healthy')
+      expect(app.getAsyncTaskInfo().activeCount).toBe(0)
+
+      customStatus = 'HealthyBusy'
+      expect(app.getCurrentPingStatus()).toBe('HealthyBusy')
+      expect(app.getAsyncTaskInfo()).toEqual({
+        activeCount: 0,
+        runningJobs: [],
+      })
+
+      expect(app.getCurrentPingStatus()).toBe('HealthyBusy')
+      expect(app.getAsyncTaskInfo().activeCount).toBe(0)
+
+      customStatus = 'Healthy'
+      expect(app.getCurrentPingStatus()).toBe('Healthy')
+      expect(app.getAsyncTaskInfo().activeCount).toBe(0)
     })
   })
 

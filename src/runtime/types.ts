@@ -263,8 +263,9 @@ export interface BedrockAgentCoreAppParams<TSchema extends z.ZodSchema = z.ZodSc
   config?: BedrockAgentCoreAppConfig
   /**
    * Custom ping handler to determine health status.
+   * Called synchronously during /ping requests.
    */
-  pingHandler?: () => HealthStatus | Promise<HealthStatus>
+  pingHandler?: () => HealthStatus
 }
 
 /**
@@ -283,6 +284,7 @@ export interface HealthCheckResponse {
 
   /**
    * Unix timestamp in seconds of the last status update.
+   * Refreshed on each HealthyBusy ping so AgentCore receives a busy heartbeat.
    */
   time_of_last_update: number
 }
