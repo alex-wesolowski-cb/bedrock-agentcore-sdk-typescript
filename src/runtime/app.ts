@@ -61,7 +61,7 @@ export class BedrockAgentCoreApp<TSchema extends z.ZodSchema = z.ZodSchema<unkno
   private _websocketHandler: WebSocketHandler | undefined
   private readonly _activeTasksMap: Map<number, AsyncTaskInfo> = new Map()
   private _taskCounter: number = 0
-  private _pingHandler: (() => HealthStatus | Promise<HealthStatus>) | undefined
+  private _pingHandler: (() => HealthStatus) | undefined
   private _forcedPingStatus?: HealthStatus
   private _lastStatusUpdateTime: number = Date.now()
   private _lastKnownStatus?: HealthStatus
@@ -159,27 +159,34 @@ export class BedrockAgentCoreApp<TSchema extends z.ZodSchema = z.ZodSchema<unkno
    * @returns Current health status
    */
   public getCurrentPingStatus(): HealthStatus {
-    // Priority 1: Forced status
-    if (this._forcedPingStatus) {
-      return this._forcedPingStatus
-    }
+    let status: HealthStatus | undefined
 
-    // Priority 2: Custom handler
-    if (this._pingHandler) {
+    if (this._forcedPingStatus) {
+      // Priority 1: Forced status
+      status = this._forcedPingStatus
+    } else if (this._pingHandler) {
+      // Priority 2: Custom handler
       try {
-        const result = this._pingHandler()
-        // Handle both sync and async handlers
-        return result instanceof Promise ? 'Healthy' : result
+        const result: unknown = this._pingHandler()
+        if (this._isHealthStatus(result)) {
+          status = result
+        } else if (this._isPromiseLike(result)) {
+          this._handleUnsupportedAsyncPingHandler(result)
+        } else if (result !== undefined) {
+          this._app.log.warn(`status=<${String(result)}> | custom ping handler returned invalid status`)
+        }
       } catch {
-        this._app.log.warn('Custom ping handler failed, falling back to automatic')
+        this._app.log.warn('custom ping handler failed, falling back to automatic')
       }
     }
 
-    // Priority 3: Automatic based on active tasks
-    const status: HealthStatus = this._activeTasksMap.size > 0 ? 'HealthyBusy' : 'Healthy'
+    if (status === undefined) {
+      // Priority 3: Automatic based on active tasks
+      status = this._activeTasksMap.size > 0 ? 'HealthyBusy' : 'Healthy'
+    }
 
-    // Track status changes
-    if (!this._lastKnownStatus || this._lastKnownStatus !== status) {
+    // Track status changes after forced, custom, and automatic status resolution.
+    if (this._lastKnownStatus === undefined || this._lastKnownStatus !== status || status === 'HealthyBusy') {
       this._lastKnownStatus = status
       this._lastStatusUpdateTime = Date.now()
     }
@@ -230,6 +237,32 @@ export class BedrockAgentCoreApp<TSchema extends z.ZodSchema = z.ZodSchema<unkno
     return {
       activeCount: this._activeTasksMap.size,
       runningJobs,
+    }
+  }
+
+  private _isHealthStatus(status: unknown): status is HealthStatus {
+    return status === 'Healthy' || status === 'HealthyBusy'
+  }
+
+  private _isPromiseLike(value: unknown): value is PromiseLike<unknown> {
+    return (
+      (typeof value === 'object' || typeof value === 'function') &&
+      value !== null &&
+      'then' in value &&
+      typeof value.then === 'function'
+    )
+  }
+
+  private _handleUnsupportedAsyncPingHandler(result: PromiseLike<unknown>): void {
+    this._app.log.warn('custom ping handler returned a promise, falling back to automatic')
+    void this._logUnsupportedAsyncPingHandlerFailure(result)
+  }
+
+  private async _logUnsupportedAsyncPingHandlerFailure(result: PromiseLike<unknown>): Promise<void> {
+    try {
+      await result
+    } catch {
+      this._app.log.warn('custom ping handler failed asynchronously, falling back to automatic')
     }
   }
 
